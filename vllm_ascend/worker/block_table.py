@@ -159,6 +159,21 @@ class BlockTable:
             # may be exposed as plain Python callables instead of launcher objects.
             # Fall back to a torch implementation to keep model execution functional.
             if hasattr(_compute_slot_mapping_kernel, "__getitem__"):
+                kernel_kwargs = {
+                    "TOTAL_CP_WORLD_SIZE": total_cp_world_size,
+                    "TOTAL_CP_RANK": total_cp_rank,
+                    "CP_KV_CACHE_INTERLEAVE_SIZE": self.cp_kv_cache_interleave_size,
+                    "PAD_ID": PAD_SLOT_ID,
+                    "BLOCK_SIZE": 1024,
+                }
+                if not vllm_version_is("0.25.1"):
+                    # vLLM #40996 split physical KV blocks into kernel blocks in
+                    # the slot-mapping kernel. These are required constexprs on
+                    # main; the v0.25.1 kernel does not accept them.
+                    kernel_kwargs.update(
+                        KV_CACHE_BLOCK_SIZE=self.physical_block_size,
+                        BLOCKS_PER_KV_BLOCK=self.blocks_per_phys_block,
+                    )
                 _compute_slot_mapping_kernel[(num_reqs + 1,)](
                     num_tokens,
                     self.max_num_batched_tokens,
@@ -168,11 +183,7 @@ class BlockTable:
                     self.block_table.gpu.stride(0),
                     self.block_size,
                     self.slot_mapping.gpu,
-                    TOTAL_CP_WORLD_SIZE=total_cp_world_size,
-                    TOTAL_CP_RANK=total_cp_rank,
-                    CP_KV_CACHE_INTERLEAVE_SIZE=self.cp_kv_cache_interleave_size,
-                    PAD_ID=PAD_SLOT_ID,
-                    BLOCK_SIZE=1024,
+                    **kernel_kwargs,
                 )
             else:
                 self._compute_slot_mapping_fallback(
