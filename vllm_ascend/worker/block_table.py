@@ -5,10 +5,12 @@ from vllm.utils.math_utils import cdiv
 from vllm.v1.attention.backends.utils import PAD_SLOT_ID
 from vllm.v1.kv_cache_interface import KVCacheGroupSpec, MambaSpec, UniformTypeKVCacheSpecs
 from vllm.v1.utils import CpuGpuBuffer
-from vllm.v1.worker.block_table import _compute_slot_mapping_kernel
 
 from vllm_ascend.distributed.utils import get_decode_context_model_parallel_world_size
-from vllm_ascend.utils import vllm_version_is
+from vllm_ascend.ops.triton.compute_slot_mapping import (
+    _compute_slot_mapping_kernel,
+    _next_power_of_2,
+)
 
 
 class BlockTable:
@@ -156,25 +158,23 @@ class BlockTable:
             )
             self._compute_dcp_slot_mapping(req_indices, positions)
         else:
-            # NOTE: In some runtime combinations, upstream Triton-decorated kernels
-            # may be exposed as plain Python callables instead of launcher objects.
-            # Fall back to a torch implementation to keep model execution functional.
+            # NOTE: Triton-decorated kernels are exposed as plain Python callables
+            # instead of launcher objects when Triton is unavailable and vLLM falls
+            # back to its Triton placeholder. Use an equivalent torch implementation
+            # in that case to keep model execution functional.
             if hasattr(_compute_slot_mapping_kernel, "__getitem__"):
+                TILE_BLOCK_SIZE = 1024
                 kernel_kwargs = {
+                    "KV_CACHE_BLOCK_SIZE": self.physical_block_size,
+                    "BLOCKS_PER_KV_BLOCK": self.blocks_per_phys_block,
                     "TOTAL_CP_WORLD_SIZE": total_cp_world_size,
                     "TOTAL_CP_RANK": total_cp_rank,
                     "CP_KV_CACHE_INTERLEAVE_SIZE": self.cp_kv_cache_interleave_size,
                     "PAD_ID": PAD_SLOT_ID,
-                    "BLOCK_SIZE": 1024,
+                    "TILE_BLOCK_SIZE": TILE_BLOCK_SIZE,
+                    "BLOCK_TABLE_WINDOW_SIZE": _next_power_of_2(cdiv(TILE_BLOCK_SIZE, self.block_size) + 1),
                 }
-                if not vllm_version_is("0.25.1"):
-                    # vLLM #40996 split physical KV blocks into kernel blocks in
-                    # the slot-mapping kernel. These are required constexprs on
-                    # main; the v0.25.1 kernel does not accept them.
-                    kernel_kwargs.update(
-                        KV_CACHE_BLOCK_SIZE=self.physical_block_size,
-                        BLOCKS_PER_KV_BLOCK=self.blocks_per_phys_block,
-                    )
+
                 _compute_slot_mapping_kernel[(num_reqs + 1,)](
                     num_tokens,
                     self.max_num_batched_tokens,
@@ -189,7 +189,6 @@ class BlockTable:
             else:
                 self._compute_slot_mapping_fallback(
                     num_reqs=num_reqs,
-                    num_tokens=num_tokens,
                     query_start_loc=query_start_loc,
                     positions=positions,
                     total_cp_world_size=total_cp_world_size,
@@ -199,20 +198,27 @@ class BlockTable:
     def _compute_slot_mapping_fallback(
         self,
         num_reqs: int,
-        num_tokens: int,
         query_start_loc: torch.Tensor,
         positions: torch.Tensor,
         total_cp_world_size: int,
         total_cp_rank: int,
     ) -> None:
+        """Torch equivalent of ``_compute_slot_mapping_kernel``.
+
+        Only used when the Triton kernel is not launchable in the current runtime.
+        """
         slot_mapping_gpu = self.slot_mapping.gpu
         slot_mapping_gpu[: self.max_num_batched_tokens].fill_(PAD_SLOT_ID)
         block_table_gpu = self.block_table.gpu
         virtual_block_size = self.block_size * total_cp_world_size
 
+        # Transfer the request boundaries to host in one shot to avoid a
+        # device-to-host synchronization per request in the loop below.
+        req_boundaries = query_start_loc[: num_reqs + 1].tolist()
+
         for req_idx in range(num_reqs):
-            start_idx = int(query_start_loc[req_idx])
-            end_idx = int(query_start_loc[req_idx + 1])
+            start_idx = req_boundaries[req_idx]
+            end_idx = req_boundaries[req_idx + 1]
             if end_idx <= start_idx:
                 continue
 

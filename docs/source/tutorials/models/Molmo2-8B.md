@@ -38,9 +38,8 @@ Use the same Ascend driver/CANN stack and vLLM Ascend image as in [Installation]
 
 Example (single NPU, adapt image tag to your release):
 
-```{code-block} bash
-   :substitutions:
-export IMAGE=quay.io/ascend/vllm-ascend:|vllm_ascend_version|
+```bash
+export IMAGE=quay.io/ascend/vllm-ascend:{{ vllm_ascend_version }}
 
 docker run --rm \
   --name vllm-ascend \
@@ -74,8 +73,7 @@ Single-node deployment completes both Prefill and Decode within the same node, s
 
 Startup Command:
 
-```{code-block} bash
-   :substitutions:
+```bash
 vllm serve allenai/Molmo2-8B \
   --trust-remote-code \
   --dtype bfloat16 \
@@ -92,9 +90,9 @@ Key parameters:
 - `--limit-mm-per-prompt.image 1`: Limit images per prompt
 - `--limit-mm-per-prompt.video 1`: Limit videos per prompt
 
-:::{note}
-On a single **64G** NPU, if you hit OOM, lower `max_model_len`, reduce `max_num_batched_tokens`, or serve with `tensor_parallel_size` across more NPUs.
-:::
+!!! note
+
+    On a single **64G** NPU, if you hit OOM, lower `max_model_len`, reduce `max_num_batched_tokens`, or serve with `tensor_parallel_size` across more NPUs.
 
 ## Functional Verification
 
